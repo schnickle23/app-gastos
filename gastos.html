@@ -1,0 +1,1657 @@
+/**
+ * ============================================================
+ * GESTOR DE GASTOS PERSONALES — App completa
+ * Stack: React + hooks + Material Design adaptado
+ * Persistencia: localStorage + Google Sheets API
+ * Moneda principal: PEN (Soles)
+ * ============================================================
+ *
+ * DECISIONES DE DISEÑO TOMADAS:
+ * 1. Todo en un solo archivo .jsx para compatibilidad con el entorno Claude.
+ *    En producción se separaría en carpetas: /hooks, /components, /utils, /services.
+ * 2. Gráficos implementados con Recharts (disponible en el entorno).
+ * 3. El modo oscuro es fijo (no toggle), según el brief.
+ * 4. Conflictos de sync: last-write-wins (último cambio prevalece).
+ * 5. Proyección de fin de mes: promedio diario × días restantes.
+ * 6. Ingresos: sección informativa, no afectan gráficos de gastos.
+ * 7. Gastos fijos: se replican el 1° de cada mes automáticamente al abrir la app.
+ * 8. CSV: descarga todos los gastos del mes visible.
+ * 9. Fechas en formato dd/mm/yyyy para visualización; ISO internamente.
+ * ============================================================
+ */
+
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  PieChart, Pie, Cell, Legend
+} from "recharts";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. CONSTANTES GLOBALES
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VERSION = "1.0.0";
+const LS_KEY  = "gastos_app_v1";
+
+/** Categorías por defecto */
+const DEFAULT_CATEGORIES = ["Transporte","Comida","Entretenimiento","Salud"];
+
+/** Métodos de pago */
+const PAYMENT_METHODS = ["BCP crédito","Amex","Yape","Plin","Efectivo"];
+
+/** Tipos de ingreso */
+const INCOME_TYPES = ["Sueldo","Extra"];
+
+/** Colores para gráfico de torta */
+const PIE_COLORS = ["#2196F3","#4CAF50","#FF5722","#9C27B0","#FF9800","#00BCD4","#E91E63","#607D8B"];
+
+/** Meses en español */
+const MONTHS_ES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
+const MONTHS_SHORT = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+
+// Nombres de hojas en Google Sheets
+const SHEET_GASTOS   = "Gastos";
+const SHEET_FIJOS    = "Fijos";
+const SHEET_CATS     = "Categorias";
+const SHEET_INGRESOS = "Ingresos";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. UTILIDADES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Genera un ID único */
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+/** Formatea número como moneda */
+const fmtPEN = (n) =>
+  "S/ " + Number(n || 0).toLocaleString("es-PE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/** Formatea fecha ISO → dd/mm/yyyy */
+const fmtDate = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return `${String(d.getDate()).padStart(2,"0")}/${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`;
+};
+
+/** Formatea fecha ISO → "Hoy", "Ayer" o dd/mm */
+const fmtDateShort = (iso) => {
+  const now  = new Date();
+  const date = new Date(iso);
+  const diff = Math.floor((now - date) / 86400000);
+  if (diff === 0) return "Hoy";
+  if (diff === 1) return "Ayer";
+  return `${String(date.getDate()).padStart(2,"0")}/${String(date.getMonth()+1).padStart(2,"0")}`;
+};
+
+/** Clave mes: "2026-05" */
+const monthKey = (date) => {
+  const d = new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+};
+
+/** Mes actual */
+const currentMonthKey = () => monthKey(new Date());
+
+/** Días transcurridos en el mes */
+const daysElapsed = () => new Date().getDate();
+
+/** Días totales en el mes */
+const daysInMonth = (key) => {
+  const [y, m] = key.split("-").map(Number);
+  return new Date(y, m, 0).getDate();
+};
+
+/** Nombre legible del mes key */
+const monthLabel = (key) => {
+  const [y, m] = key.split("-").map(Number);
+  return `${MONTHS_ES[m-1]} ${y}`;
+};
+
+/** Descarga string como archivo */
+const downloadFile = (content, filename, mime = "text/csv;charset=utf-8;") => {
+  const blob = new Blob([content], { type: mime });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+/** Exporta gastos a CSV */
+const exportCSV = (gastos) => {
+  const header = "ID,Nombre,Categoría,Monto,Moneda,Método,Fecha,Hora\n";
+  const rows   = gastos.map(g => {
+    const d = new Date(g.fecha);
+    return [
+      g.id, `"${g.nombre}"`, `"${g.categoria}"`,
+      g.monto, g.moneda, `"${g.metodo}"`,
+      fmtDate(g.fecha),
+      `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`
+    ].join(",");
+  }).join("\n");
+  downloadFile(header + rows, `gastos_${currentMonthKey()}.csv`);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. LOCAL STORAGE SERVICE
+// ─────────────────────────────────────────────────────────────────────────────
+
+const initialState = () => ({
+  gastos:     [],   // { id, nombre, categoria, monto, moneda, metodo, fecha }
+  fijos:      [],   // { id, nombre, monto, dia, pagadoEn: [] }
+  categorias: [...DEFAULT_CATEGORIES],
+  ingresos:   [],   // { id, tipo, monto, fecha, nota }
+  config:     { apiKey: "", spreadsheetId: "", lastSync: null },
+  lastFijosMonth: null,
+});
+
+const loadLS = () => {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return initialState();
+    return { ...initialState(), ...JSON.parse(raw) };
+  } catch { return initialState(); }
+};
+
+const saveLS = (state) => {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch {}
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. GOOGLE SHEETS SERVICE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Lee valores de una hoja */
+async function sheetsRead(config, sheet) {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.spreadsheetId}/values/${sheet}?key=${config.apiKey}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Sheets read error: ${res.status}`);
+  const data = await res.json();
+  return data.values || [];
+}
+
+/** Sobreescribe una hoja completa */
+async function sheetsWrite(config, sheet, rows) {
+  // Limpiar
+  await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${config.spreadsheetId}/values/${sheet}!A1:ZZ99999:clear?key=${config.apiKey}`,
+    { method: "POST", headers: { "Content-Type": "application/json" } }
+  );
+  if (!rows.length) return;
+  // Escribir
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.spreadsheetId}/values/${sheet}!A1?valueInputOption=RAW&key=${config.apiKey}`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ values: rows }),
+  });
+  if (!res.ok) throw new Error(`Sheets write error: ${res.status}`);
+}
+
+/** Parsea filas de Gastos */
+const parseGastos = (rows) => {
+  if (rows.length < 2) return [];
+  return rows.slice(1).map(r => ({
+    id: r[0]||uid(), nombre: r[1]||"", categoria: r[2]||"",
+    monto: parseFloat(r[3])||0, moneda: r[4]||"PEN",
+    metodo: r[5]||"", fecha: r[6]||new Date().toISOString(),
+  })).filter(g => g.nombre);
+};
+
+/** Parsea filas de Fijos */
+const parseFijos = (rows) => {
+  if (rows.length < 2) return [];
+  return rows.slice(1).map(r => ({
+    id: r[0]||uid(), nombre: r[1]||"", monto: parseFloat(r[2])||0,
+    dia: parseInt(r[3])||1, pagadoEn: r[4] ? r[4].split(",") : [],
+  })).filter(f => f.nombre);
+};
+
+/** Parsea filas de Ingresos */
+const parseIngresos = (rows) => {
+  if (rows.length < 2) return [];
+  return rows.slice(1).map(r => ({
+    id: r[0]||uid(), tipo: r[1]||"Sueldo",
+    monto: parseFloat(r[2])||0, fecha: r[3]||new Date().toISOString(), nota: r[4]||"",
+  })).filter(i => i.monto);
+};
+
+/** Sincroniza estado → Google Sheets (last-write-wins) */
+async function syncToSheets(config, state) {
+  const g = [
+    ["id","nombre","categoria","monto","moneda","metodo","fecha"],
+    ...state.gastos.map(g => [g.id,g.nombre,g.categoria,g.monto,g.moneda,g.metodo,g.fecha]),
+  ];
+  const f = [
+    ["id","nombre","monto","dia","pagadoEn"],
+    ...state.fijos.map(f => [f.id,f.nombre,f.monto,f.dia,(f.pagadoEn||[]).join(",")]),
+  ];
+  const c = [["categoria"], ...state.categorias.map(c => [c])];
+  const i = [
+    ["id","tipo","monto","fecha","nota"],
+    ...state.ingresos.map(i => [i.id,i.tipo,i.monto,i.fecha,i.nota]),
+  ];
+  await Promise.all([
+    sheetsWrite(config, SHEET_GASTOS,   g),
+    sheetsWrite(config, SHEET_FIJOS,    f),
+    sheetsWrite(config, SHEET_CATS,     c),
+    sheetsWrite(config, SHEET_INGRESOS, i),
+  ]);
+}
+
+/** Lee desde Google Sheets → estado */
+async function syncFromSheets(config) {
+  const [gRows, fRows, cRows, iRows] = await Promise.all([
+    sheetsRead(config, SHEET_GASTOS),
+    sheetsRead(config, SHEET_FIJOS),
+    sheetsRead(config, SHEET_CATS),
+    sheetsRead(config, SHEET_INGRESOS),
+  ]);
+  return {
+    gastos:     parseGastos(gRows),
+    fijos:      parseFijos(fRows),
+    categorias: cRows.length > 1 ? cRows.slice(1).map(r => r[0]).filter(Boolean) : [...DEFAULT_CATEGORIES],
+    ingresos:   parseIngresos(iRows),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. ESTILOS CSS
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Google+Sans+Mono&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:        #0f1115;
+    --bg2:       #181b22;
+    --bg3:       #20242e;
+    --bg4:       #272c38;
+    --border:    #2e3340;
+    --blue:      #2196F3;
+    --blue-dim:  #1565C0;
+    --green:     #4CAF50;
+    --red:       #F44336;
+    --red-dim:   #b71c1c;
+    --yellow:    #FFC107;
+    --text:      #FFFFFF;
+    --text2:     #B0BEC5;
+    --text3:     #546E7A;
+    --radius:    14px;
+    --radius-sm: 8px;
+    --shadow:    0 4px 24px rgba(0,0,0,0.5);
+    --font:      'Google Sans', 'Segoe UI', sans-serif;
+    --font-mono: 'Google Sans Mono', monospace;
+    --transition: 0.18s cubic-bezier(0.4,0,0.2,1);
+  }
+
+  html, body, #root { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); }
+  body { overflow-x: hidden; }
+  button { font-family: var(--font); cursor: pointer; border: none; outline: none; }
+  input, select, textarea { font-family: var(--font); color: var(--text); background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 15px; width: 100%; outline: none; transition: border-color var(--transition); }
+  input:focus, select:focus { border-color: var(--blue); }
+  input::placeholder { color: var(--text3); }
+  select option { background: var(--bg3); }
+  ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  /* Layout */
+  .app-shell { display: flex; flex-direction: column; height: 100vh; max-width: 480px; margin: 0 auto; position: relative; background: var(--bg); }
+  .screen { flex: 1; overflow-y: auto; padding: 0 0 80px; }
+  .screen-pad { padding: 16px; }
+
+  /* Bottom Nav */
+  .bottom-nav { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 480px; background: var(--bg2); border-top: 1px solid var(--border); display: flex; z-index: 30; }
+  .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 10px 0 14px; gap: 3px; background: none; color: var(--text3); font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; transition: color var(--transition); position: relative; }
+  .nav-item.active { color: var(--blue); }
+  .nav-item.active::after { content:''; position:absolute; top:0; left:20%; right:20%; height:2px; background:var(--blue); border-radius:0 0 2px 2px; }
+  .nav-icon { font-size: 20px; line-height: 1; }
+  .fab-placeholder { width: 56px; }
+
+  /* FAB */
+  .fab { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); width: 56px; height: 56px; border-radius: 50%; background: var(--blue); color: #fff; font-size: 28px; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 16px rgba(33,150,243,0.5); z-index: 31; transition: background var(--transition), transform var(--transition), box-shadow var(--transition); }
+  .fab:hover { background: var(--blue-dim); transform: translateX(-50%) scale(1.07); box-shadow: 0 6px 24px rgba(33,150,243,0.6); }
+  .fab:active { transform: translateX(-50%) scale(0.95); }
+
+  /* Cards */
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; }
+  .card-sm { padding: 12px 14px; }
+
+  /* Hero circle */
+  .hero-wrap { display: flex; flex-direction: column; align-items: center; padding: 32px 16px 20px; }
+  .hero-circle { width: 180px; height: 180px; border-radius: 50%; background: conic-gradient(var(--blue) 0%, var(--bg3) 0%); display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; box-shadow: 0 0 0 6px var(--bg2), 0 0 0 7px var(--border), var(--shadow); transition: all 0.4s cubic-bezier(0.4,0,0.2,1); }
+  .hero-label { font-size: 11px; color: var(--text3); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 4px; }
+  .hero-amount { font-size: 26px; font-weight: 700; color: var(--text); line-height: 1; }
+  .hero-month { font-size: 12px; color: var(--text2); margin-top: 6px; }
+
+  /* KPI row */
+  .kpi-row { display: flex; gap: 10px; padding: 0 16px 16px; }
+  .kpi-card { flex: 1; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 12px; text-align: center; }
+  .kpi-value { font-size: 17px; font-weight: 700; margin-bottom: 4px; }
+  .kpi-label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.06em; }
+
+  /* Gasto item */
+  .gasto-item { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); animation: fadeSlide 0.2s ease; }
+  .gasto-item:last-child { border-bottom: none; }
+  .gasto-icon { width: 40px; height: 40px; border-radius: 50%; background: var(--bg3); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+  .gasto-info { flex: 1; min-width: 0; }
+  .gasto-nombre { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gasto-meta { font-size: 11px; color: var(--text3); margin-top: 2px; }
+  .gasto-monto { font-size: 15px; font-weight: 700; color: var(--red); flex-shrink: 0; }
+  .gasto-actions { display: flex; gap: 6px; margin-left: 6px; }
+  .icon-btn { background: none; border: none; padding: 4px; color: var(--text3); font-size: 15px; border-radius: 50%; transition: color var(--transition), background var(--transition); }
+  .icon-btn:hover { color: var(--text); background: var(--bg3); }
+
+  /* Day group */
+  .day-group { margin-bottom: 8px; }
+  .day-header { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; padding: 8px 0 6px; border-bottom: 1px solid var(--border); margin-bottom: 2px; display: flex; justify-content: space-between; }
+
+  /* Section header */
+  .section-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 16px 8px; }
+  .section-title { font-size: 13px; font-weight: 500; color: var(--text2); text-transform: uppercase; letter-spacing: 0.1em; }
+  .section-action { font-size: 12px; color: var(--blue); background: none; border: none; padding: 4px 8px; border-radius: 20px; }
+  .section-action:hover { background: rgba(33,150,243,0.1); }
+
+  /* Filter chips */
+  .chips { display: flex; gap: 8px; padding: 0 16px 12px; overflow-x: auto; }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip { padding: 6px 14px; border-radius: 20px; font-size: 12px; border: 1px solid var(--border); background: var(--bg2); color: var(--text2); white-space: nowrap; transition: all var(--transition); flex-shrink: 0; }
+  .chip.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+
+  /* Modal */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; display: flex; align-items: flex-end; justify-content: center; animation: fadein 0.15s ease; }
+  .modal-sheet { background: var(--bg2); border-radius: 20px 20px 0 0; width: 100%; max-width: 480px; max-height: 92vh; overflow-y: auto; padding: 0 0 32px; border: 1px solid var(--border); border-bottom: none; animation: slideUp 0.25s cubic-bezier(0.4,0,0.2,1); }
+  .modal-handle { width: 36px; height: 4px; background: var(--border); border-radius: 2px; margin: 12px auto 8px; }
+  .modal-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px 16px; border-bottom: 1px solid var(--border); }
+  .modal-title { font-size: 17px; font-weight: 700; }
+  .close-btn { width: 32px; height: 32px; border-radius: 50%; background: var(--bg3); color: var(--text2); font-size: 18px; display: flex; align-items: center; justify-content: center; border: none; transition: background var(--transition); }
+  .close-btn:hover { background: var(--bg4); color: var(--text); }
+  .modal-body { padding: 20px 20px 0; display: flex; flex-direction: column; gap: 14px; }
+  .field-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+  .field-row { display: flex; gap: 10px; }
+  .field-row > * { flex: 1; }
+
+  /* Buttons */
+  .btn { padding: 14px 20px; border-radius: var(--radius-sm); font-size: 15px; font-weight: 500; text-align: center; transition: all var(--transition); border: none; }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-primary:hover { background: var(--blue-dim); }
+  .btn-primary:active { transform: scale(0.97); }
+  .btn-danger  { background: var(--red); color: #fff; }
+  .btn-danger:hover  { background: var(--red-dim); }
+  .btn-ghost   { background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }
+  .btn-ghost:hover { background: var(--bg4); color: var(--text); }
+  .btn-sm { padding: 8px 14px; font-size: 13px; }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* Badge */
+  .badge { display: inline-flex; align-items: center; padding: 3px 9px; border-radius: 20px; font-size: 11px; font-weight: 500; }
+  .badge-blue  { background: rgba(33,150,243,0.15); color: var(--blue); }
+  .badge-green { background: rgba(76,175,80,0.15);  color: var(--green); }
+  .badge-red   { background: rgba(244,67,54,0.15);  color: var(--red); }
+  .badge-yellow{ background: rgba(255,193,7,0.15);  color: var(--yellow); }
+
+  /* Insights */
+  .insight-card { display: flex; align-items: flex-start; gap: 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin-bottom: 10px; }
+  .insight-icon { font-size: 22px; flex-shrink: 0; margin-top: 1px; }
+  .insight-title { font-size: 13px; font-weight: 500; margin-bottom: 3px; }
+  .insight-desc  { font-size: 12px; color: var(--text2); line-height: 1.5; }
+
+  /* Fijo item */
+  .fijo-item { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .fijo-item:last-child { border-bottom: none; }
+  .fijo-check { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all var(--transition); flex-shrink: 0; }
+  .fijo-check.done { background: var(--green); border-color: var(--green); }
+
+  /* Sync badge */
+  .sync-badge { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 11px; }
+  .sync-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .dot-ok      { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-error   { background: var(--red); }
+  .dot-loading { background: var(--yellow); animation: pulse 0.8s infinite; }
+  .dot-idle    { background: var(--text3); }
+
+  /* Topbar */
+  .topbar { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 0; }
+  .topbar-title { font-size: 20px; font-weight: 700; }
+  .topbar-actions { display: flex; gap: 8px; }
+  .topbar-btn { background: var(--bg3); border: 1px solid var(--border); border-radius: 20px; padding: 6px 12px; font-size: 12px; color: var(--text2); display: flex; align-items: center; gap: 5px; transition: all var(--transition); }
+  .topbar-btn:hover { background: var(--bg4); color: var(--text); }
+
+  /* Ingreso item */
+  .ingreso-item { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .ingreso-item:last-child { border-bottom: none; }
+  .ingreso-monto { font-size: 15px; font-weight: 700; color: var(--green); margin-left: auto; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 40px 20px; color: var(--text3); }
+  .empty-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.4; }
+  .empty-text { font-size: 14px; }
+
+  /* Confirm dialog */
+  .confirm-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .confirm-box { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; max-width: 340px; width: 100%; }
+  .confirm-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+  .confirm-text  { font-size: 13px; color: var(--text2); margin-bottom: 20px; line-height: 1.5; }
+  .confirm-btns  { display: flex; gap: 10px; }
+  .confirm-btns > * { flex: 1; }
+
+  /* Toast */
+  .toast-container { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 300; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
+  .toast { background: var(--bg4); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 18px; font-size: 13px; color: var(--text); box-shadow: var(--shadow); animation: fadeSlide 0.2s ease; max-width: 320px; text-align: center; }
+  .toast.ok    { border-color: var(--green); }
+  .toast.error { border-color: var(--red); color: var(--red); }
+
+  /* Tooltip Recharts custom */
+  .chart-tooltip { background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px; font-size: 12px; }
+
+  /* Config screen */
+  .config-section { padding: 16px; }
+  .step-num { width: 24px; height: 24px; border-radius: 50%; background: var(--blue); color: #fff; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .step-row { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 12px; }
+  .step-text { font-size: 13px; color: var(--text2); line-height: 1.5; padding-top: 3px; }
+
+  /* Animations */
+  @keyframes fadeSlide { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes slideUp   { from { transform:translateY(60px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+  @keyframes fadein    { from { opacity:0; } to { opacity:1; } }
+  @keyframes pulse     { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+  @keyframes spin      { to { transform: rotate(360deg); } }
+  .spin { animation: spin 0.8s linear infinite; display: inline-block; }
+
+  /* Chart container */
+  .chart-wrap { width: 100%; padding: 0 0 4px; }
+  .recharts-text { fill: var(--text3) !important; font-size: 11px !important; }
+
+  /* History month button */
+  .month-btn { background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: background var(--transition); width: 100%; }
+  .month-btn:hover { background: var(--bg4); }
+  .month-btn.active { border-color: var(--blue); }
+  .month-btn-label { font-size: 14px; font-weight: 500; }
+  .month-btn-amount { font-size: 14px; color: var(--red); font-weight: 700; }
+
+  /* Autocomplete */
+  .autocomplete-wrap { position: relative; }
+  .autocomplete-list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm); z-index: 50; max-height: 180px; overflow-y: auto; box-shadow: var(--shadow); }
+  .autocomplete-item { padding: 10px 14px; font-size: 14px; cursor: pointer; transition: background var(--transition); }
+  .autocomplete-item:hover { background: var(--bg4); }
+
+  /* Colores por categoría */
+  .cat-Transporte     { background: rgba(33,150,243,0.15); color:#2196F3; }
+  .cat-Comida         { background: rgba(76,175,80,0.15);  color:#4CAF50; }
+  .cat-Entretenimiento{ background: rgba(156,39,176,0.15); color:#9C27B0; }
+  .cat-Salud          { background: rgba(244,67,54,0.15);  color:#F44336; }
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. HOOKS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Hook principal de estado global */
+function useAppState() {
+  const [state, setState] = useState(() => loadLS());
+
+  // Persiste en localStorage cada vez que cambia el estado
+  useEffect(() => { saveLS(state); }, [state]);
+
+  // Al montar: replica gastos fijos si es un mes nuevo
+  useEffect(() => {
+    const mk = currentMonthKey();
+    if (state.lastFijosMonth === mk) return;
+    if (!state.fijos.length) return;
+
+    // Crea gastos para los fijos que no tienen gasto en este mes
+    const nuevos = state.fijos.map(f => ({
+      id: uid(), nombre: f.nombre, categoria: "Fijos",
+      monto: f.monto, moneda: "PEN", metodo: "Efectivo",
+      fecha: new Date(`${mk}-${String(f.dia).padStart(2,"0")}T08:00:00`).toISOString(),
+    }));
+
+    setState(prev => ({
+      ...prev,
+      gastos: [...prev.gastos, ...nuevos],
+      lastFijosMonth: mk,
+    }));
+  // eslint-disable-next-line
+  }, []);
+
+  /** CRUD Gastos */
+  const addGasto = useCallback((gasto) => {
+    setState(prev => ({ ...prev, gastos: [{ id: uid(), ...gasto }, ...prev.gastos] }));
+  }, []);
+
+  const editGasto = useCallback((id, data) => {
+    setState(prev => ({ ...prev, gastos: prev.gastos.map(g => g.id === id ? { ...g, ...data } : g) }));
+  }, []);
+
+  const deleteGasto = useCallback((id) => {
+    setState(prev => ({ ...prev, gastos: prev.gastos.filter(g => g.id !== id) }));
+  }, []);
+
+  /** CRUD Fijos */
+  const addFijo = useCallback((fijo) => {
+    setState(prev => ({ ...prev, fijos: [...prev.fijos, { id: uid(), ...fijo, pagadoEn: [] }] }));
+  }, []);
+
+  const editFijo = useCallback((id, data) => {
+    setState(prev => ({ ...prev, fijos: prev.fijos.map(f => f.id === id ? { ...f, ...data } : f) }));
+  }, []);
+
+  const deleteFijo = useCallback((id) => {
+    setState(prev => ({ ...prev, fijos: prev.fijos.filter(f => f.id !== id) }));
+  }, []);
+
+  const toggleFijoPagado = useCallback((id) => {
+    const mk = currentMonthKey();
+    setState(prev => ({
+      ...prev,
+      fijos: prev.fijos.map(f => {
+        if (f.id !== id) return f;
+        const pagadoEn = f.pagadoEn || [];
+        return { ...f, pagadoEn: pagadoEn.includes(mk) ? pagadoEn.filter(m => m !== mk) : [...pagadoEn, mk] };
+      }),
+    }));
+  }, []);
+
+  /** CRUD Categorías */
+  const addCategoria = useCallback((cat) => {
+    if (!cat.trim()) return;
+    setState(prev => ({ ...prev, categorias: [...prev.categorias, cat.trim()] }));
+  }, []);
+
+  /** CRUD Ingresos */
+  const addIngreso = useCallback((ingreso) => {
+    setState(prev => ({ ...prev, ingresos: [{ id: uid(), ...ingreso }, ...prev.ingresos] }));
+  }, []);
+
+  const deleteIngreso = useCallback((id) => {
+    setState(prev => ({ ...prev, ingresos: prev.ingresos.filter(i => i.id !== id) }));
+  }, []);
+
+  /** Config */
+  const setConfig = useCallback((config) => {
+    setState(prev => ({ ...prev, config: { ...prev.config, ...config } }));
+  }, []);
+
+  /** Merge desde Sheets (last-write-wins: reemplaza todo) */
+  const mergeFromSheets = useCallback((data) => {
+    setState(prev => ({
+      ...prev,
+      gastos: data.gastos,
+      fijos: data.fijos,
+      categorias: data.categorias,
+      ingresos: data.ingresos,
+      config: { ...prev.config, lastSync: new Date().toISOString() },
+    }));
+  }, []);
+
+  const updateLastSync = useCallback(() => {
+    setState(prev => ({ ...prev, config: { ...prev.config, lastSync: new Date().toISOString() } }));
+  }, []);
+
+  return {
+    state, setState,
+    addGasto, editGasto, deleteGasto,
+    addFijo, editFijo, deleteFijo, toggleFijoPagado,
+    addCategoria,
+    addIngreso, deleteIngreso,
+    setConfig, mergeFromSheets, updateLastSync,
+  };
+}
+
+/** Hook de toast notifications */
+function useToast() {
+  const [toasts, setToasts] = useState([]);
+  const show = useCallback((msg, type = "ok") => {
+    const id = uid();
+    setToasts(t => [...t, { id, msg, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3200);
+  }, []);
+  return { toasts, show };
+}
+
+/** Hook de confirmación */
+function useConfirm() {
+  const [state, setState] = useState(null);
+  const ask = useCallback((title, text) => new Promise(resolve => {
+    setState({ title, text, resolve });
+  }), []);
+  const answer = (v) => { state?.resolve(v); setState(null); };
+  return { confirmState: state, ask, answer };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. COMPONENTES PEQUEÑOS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Toast container */
+function ToastContainer({ toasts }) {
+  return (
+    <div className="toast-container">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast ${t.type}`}>{t.msg}</div>
+      ))}
+    </div>
+  );
+}
+
+/** Diálogo de confirmación */
+function ConfirmDialog({ state, onAnswer }) {
+  if (!state) return null;
+  return (
+    <div className="confirm-overlay">
+      <div className="confirm-box">
+        <div className="confirm-title">{state.title}</div>
+        <div className="confirm-text">{state.text}</div>
+        <div className="confirm-btns">
+          <button className="btn btn-ghost" onClick={() => onAnswer(false)}>Cancelar</button>
+          <button className="btn btn-danger" onClick={() => onAnswer(true)}>Eliminar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Ícono de categoría */
+function CatIcon({ categoria }) {
+  const map = {
+    Transporte: "🚌", Comida: "🍽️", Entretenimiento: "🎬",
+    Salud: "💊", Fijos: "📌", default: "💸"
+  };
+  return <span>{map[categoria] || map.default}</span>;
+}
+
+/** Chip de estado de sync */
+function SyncBadge({ status, lastSync }) {
+  const map = {
+    ok:      { dot: "dot-ok",      text: lastSync ? `Sincronizado ${fmtDateShort(lastSync)}` : "Sincronizado" },
+    error:   { dot: "dot-error",   text: "Error de sync" },
+    loading: { dot: "dot-loading", text: "Sincronizando…" },
+    idle:    { dot: "dot-idle",    text: "Sin conectar" },
+  };
+  const { dot, text } = map[status] || map.idle;
+  return (
+    <div className="sync-badge">
+      <div className={`sync-dot ${dot}`} />
+      <span style={{ color: "var(--text3)", fontSize: 11 }}>{text}</span>
+    </div>
+  );
+}
+
+/** Input con autocompletado */
+function AutocompleteInput({ value, onChange, suggestions, placeholder }) {
+  const [open, setOpen] = useState(false);
+  const filtered = suggestions.filter(s => s.toLowerCase().includes(value.toLowerCase()) && s !== value);
+  return (
+    <div className="autocomplete-wrap">
+      <input
+        value={value}
+        onChange={e => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        placeholder={placeholder}
+      />
+      {open && filtered.length > 0 && (
+        <div className="autocomplete-list">
+          {filtered.slice(0, 8).map(s => (
+            <div key={s} className="autocomplete-item" onClick={() => { onChange(s); setOpen(false); }}>{s}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Tooltip personalizado para Recharts */
+function ChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="chart-tooltip">
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      {payload.map((p, i) => (
+        <div key={i} style={{ color: p.color }}>{p.name}: {fmtPEN(p.value)}</div>
+      ))}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. MODAL DE GASTO
+// ─────────────────────────────────────────────────────────────────────────────
+
+function GastoModal({ onClose, onSave, initial, categorias, gastos }) {
+  const isEdit = !!initial;
+  const [form, setForm] = useState({
+    nombre: initial?.nombre || "",
+    categoria: initial?.categoria || categorias[0] || "",
+    monto: initial?.monto || "",
+    moneda: initial?.moneda || "PEN",
+    metodo: initial?.metodo || PAYMENT_METHODS[0],
+  });
+  const [newCat, setNewCat] = useState("");
+  const [showNewCat, setShowNewCat] = useState(false);
+  const [err, setErr] = useState({});
+
+  // Sugerencias de nombres basadas en registros previos
+  const nameSuggestions = useMemo(() =>
+    [...new Set(gastos.map(g => g.nombre))].filter(Boolean), [gastos]);
+
+  const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
+
+  const validate = () => {
+    const e = {};
+    if (!form.nombre.trim()) e.nombre = "Requerido";
+    if (!form.monto || isNaN(form.monto) || Number(form.monto) <= 0) e.monto = "Monto inválido";
+    setErr(e);
+    return !Object.keys(e).length;
+  };
+
+  const handleSave = () => {
+    if (!validate()) return;
+    onSave({
+      nombre: form.nombre.trim(),
+      categoria: form.categoria,
+      monto: parseFloat(parseFloat(form.monto).toFixed(2)),
+      moneda: form.moneda,
+      metodo: form.metodo,
+      fecha: initial?.fecha || new Date().toISOString(),
+    });
+    onClose();
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-sheet" onClick={e => e.stopPropagation()}>
+        <div className="modal-handle" />
+        <div className="modal-header">
+          <span className="modal-title">{isEdit ? "Editar gasto" : "Nuevo gasto"}</span>
+          <button className="close-btn" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+
+          {/* Nombre */}
+          <div>
+            <div className="field-label">Nombre</div>
+            <AutocompleteInput
+              value={form.nombre}
+              onChange={v => set("nombre", v)}
+              suggestions={nameSuggestions}
+              placeholder="Ej: Taxi al trabajo"
+            />
+            {err.nombre && <div style={{ color: "var(--red)", fontSize: 11, marginTop: 4 }}>{err.nombre}</div>}
+          </div>
+
+          {/* Categoría */}
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div className="field-label">Categoría</div>
+              <button className="section-action" style={{ fontSize: 11 }} onClick={() => setShowNewCat(p => !p)}>
+                {showNewCat ? "Cancelar" : "+ Nueva"}
+              </button>
+            </div>
+            {showNewCat ? (
+              <div className="field-row" style={{ marginTop: 6 }}>
+                <input placeholder="Nombre de categoría" value={newCat} onChange={e => setNewCat(e.target.value)} />
+                <button className="btn btn-primary btn-sm" style={{ flex: "0 0 auto" }} onClick={() => {
+                  if (newCat.trim()) { set("categoria", newCat.trim()); }
+                  setShowNewCat(false); setNewCat("");
+                }}>Agregar</button>
+              </div>
+            ) : (
+              <div className="chips" style={{ padding: "8px 0 0", flexWrap: "wrap" }}>
+                {[...categorias, "Fijos"].map(c => (
+                  <button key={c} className={`chip ${form.categoria === c ? "active" : ""}`}
+                    onClick={() => set("categoria", c)}>{c}</button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Monto + Moneda */}
+          <div>
+            <div className="field-label">Monto</div>
+            <div className="field-row">
+              <input type="number" min="0" step="0.01" placeholder="0.00"
+                value={form.monto} onChange={e => set("monto", e.target.value)} />
+              <select value={form.moneda} onChange={e => set("moneda", e.target.value)} style={{ flex: "0 0 90px" }}>
+                <option>PEN</option>
+                <option>USD</option>
+              </select>
+            </div>
+            {err.monto && <div style={{ color: "var(--red)", fontSize: 11, marginTop: 4 }}>{err.monto}</div>}
+          </div>
+
+          {/* Método de pago */}
+          <div>
+            <div className="field-label">Método de pago</div>
+            <select value={form.metodo} onChange={e => set("metodo", e.target.value)}>
+              {PAYMENT_METHODS.map(m => <option key={m}>{m}</option>)}
+            </select>
+          </div>
+
+          {/* Fecha (solo edición) */}
+          {isEdit && (
+            <div>
+              <div className="field-label">Fecha y hora</div>
+              <input type="datetime-local" value={form.fecha ? new Date(form.fecha).toISOString().slice(0,16) : ""}
+                onChange={e => set("fecha", new Date(e.target.value).toISOString())} />
+            </div>
+          )}
+
+          <button className="btn btn-primary" onClick={handleSave}>
+            {isEdit ? "Guardar cambios" : "Agregar gasto"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. PANTALLA MI MES
+// ─────────────────────────────────────────────────────────────────────────────
+
+function MiMesScreen({ gastos, categorias, onEdit, onDelete, syncStatus, lastSync, onSync, onExport }) {
+  const [catFilter, setCatFilter] = useState("Todos");
+  const mk = currentMonthKey();
+
+  // Filtra solo gastos del mes actual
+  const monthGastos = useMemo(() =>
+    gastos.filter(g => monthKey(g.fecha) === mk), [gastos, mk]);
+
+  const totalMes = useMemo(() =>
+    monthGastos.reduce((s, g) => s + g.monto, 0), [monthGastos]);
+
+  // Aplica filtro de categoría
+  const filtered = useMemo(() =>
+    catFilter === "Todos" ? monthGastos : monthGastos.filter(g => g.categoria === catFilter),
+    [monthGastos, catFilter]);
+
+  // Agrupa por día
+  const byDay = useMemo(() => {
+    const groups = {};
+    filtered.forEach(g => {
+      const key = new Date(g.fecha).toISOString().split("T")[0];
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(g);
+    });
+    return Object.entries(groups)
+      .sort(([a], [b]) => b.localeCompare(a))
+      .map(([key, items]) => ({
+        key,
+        label: fmtDateShort(key + "T12:00:00"),
+        total: items.reduce((s, g) => s + g.monto, 0),
+        items: items.sort((a, b) => new Date(b.fecha) - new Date(a.fecha)),
+      }));
+  }, [filtered]);
+
+  // Gasto promedio diario
+  const avgDaily = totalMes / Math.max(daysElapsed(), 1);
+
+  return (
+    <div>
+      {/* Hero */}
+      <div className="hero-wrap">
+        <div className="hero-circle">
+          <span className="hero-label">Gastos</span>
+          <span className="hero-amount">{fmtPEN(totalMes)}</span>
+          <span className="hero-month">{monthLabel(mk)}</span>
+        </div>
+      </div>
+
+      {/* KPIs */}
+      <div className="kpi-row">
+        <div className="kpi-card">
+          <div className="kpi-value" style={{ color: "var(--blue)" }}>{fmtPEN(avgDaily)}</div>
+          <div className="kpi-label">Promedio diario</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-value" style={{ color: "var(--yellow)" }}>{monthGastos.length}</div>
+          <div className="kpi-label">Transacciones</div>
+        </div>
+      </div>
+
+      {/* Topbar con sync */}
+      <div className="topbar" style={{ padding: "4px 16px 8px" }}>
+        <SyncBadge status={syncStatus} lastSync={lastSync} />
+        <div className="topbar-actions">
+          <button className="topbar-btn" onClick={onSync}>
+            <span className={syncStatus === "loading" ? "spin" : ""}>↻</span> Sync
+          </button>
+          <button className="topbar-btn" onClick={onExport}>↓ CSV</button>
+        </div>
+      </div>
+
+      {/* Filtros */}
+      <div className="chips">
+        {["Todos", ...categorias, "Fijos"].map(c => (
+          <button key={c} className={`chip ${catFilter === c ? "active" : ""}`}
+            onClick={() => setCatFilter(c)}>{c}</button>
+        ))}
+      </div>
+
+      {/* Lista */}
+      <div className="screen-pad" style={{ paddingTop: 0 }}>
+        {byDay.length === 0 ? (
+          <div className="empty">
+            <div className="empty-icon">💸</div>
+            <div className="empty-text">No hay gastos este mes</div>
+          </div>
+        ) : byDay.map(day => (
+          <div key={day.key} className="day-group card">
+            <div className="day-header">
+              <span>{day.label}</span>
+              <span style={{ color: "var(--red)" }}>{fmtPEN(day.total)}</span>
+            </div>
+            {day.items.map(g => (
+              <GastoRow key={g.id} gasto={g} onEdit={onEdit} onDelete={onDelete} />
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function GastoRow({ gasto, onEdit, onDelete }) {
+  return (
+    <div className="gasto-item">
+      <div className="gasto-icon">
+        <CatIcon categoria={gasto.categoria} />
+      </div>
+      <div className="gasto-info">
+        <div className="gasto-nombre">{gasto.nombre}</div>
+        <div className="gasto-meta">
+          <span className="badge badge-blue" style={{ marginRight: 4, padding: "1px 7px" }}>{gasto.categoria}</span>
+          {gasto.metodo} · {gasto.moneda !== "PEN" && <span className="badge badge-yellow">{gasto.moneda}</span>}
+        </div>
+      </div>
+      <div className="gasto-monto">{fmtPEN(gasto.monto)}</div>
+      <div className="gasto-actions">
+        <button className="icon-btn" onClick={() => onEdit(gasto)} title="Editar">✏️</button>
+        <button className="icon-btn" onClick={() => onDelete(gasto)} title="Eliminar">🗑️</button>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. PANTALLA HISTÓRICO
+// ─────────────────────────────────────────────────────────────────────────────
+
+function HistoricoScreen({ gastos, categorias, onEdit, onDelete }) {
+  const [selectedMonth, setSelectedMonth] = useState(null);
+
+  // Agrupa por mes
+  const byMonth = useMemo(() => {
+    const groups = {};
+    gastos.forEach(g => {
+      const mk = monthKey(g.fecha);
+      if (!groups[mk]) groups[mk] = [];
+      groups[mk].push(g);
+    });
+    return Object.entries(groups)
+      .sort(([a], [b]) => b.localeCompare(a))
+      .map(([mk, items]) => ({
+        mk,
+        label: monthLabel(mk),
+        total: items.reduce((s, g) => s + g.monto, 0),
+        items,
+      }));
+  }, [gastos]);
+
+  // Datos para gráfico de barras
+  const chartData = useMemo(() =>
+    byMonth.slice(0, 12).reverse().map(m => ({
+      name: MONTHS_SHORT[parseInt(m.mk.split("-")[1]) - 1],
+      total: parseFloat(m.total.toFixed(2)),
+    })), [byMonth]);
+
+  const selData = selectedMonth ? byMonth.find(m => m.mk === selectedMonth) : null;
+
+  return (
+    <div className="screen-pad">
+      <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 16 }}>Histórico</div>
+
+      {/* Gráfico de barras */}
+      {chartData.length > 0 && (
+        <div className="card">
+          <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.08em" }}>Gastos por mes</div>
+          <div className="chart-wrap" style={{ height: 180 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData} barCategoryGap="30%">
+                <XAxis dataKey="name" tick={{ fill: "var(--text3)", fontSize: 10 }} axisLine={false} tickLine={false} />
+                <YAxis hide />
+                <Tooltip content={<ChartTooltip />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
+                <Bar dataKey="total" fill="var(--blue)" radius={[4,4,0,0]} name="Total" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
+      {/* Lista de meses */}
+      {byMonth.length === 0 ? (
+        <div className="empty"><div className="empty-icon">📊</div><div className="empty-text">Sin historial aún</div></div>
+      ) : byMonth.map(m => (
+        <div key={m.mk}>
+          <button className={`month-btn ${selectedMonth === m.mk ? "active" : ""}`}
+            onClick={() => setSelectedMonth(selectedMonth === m.mk ? null : m.mk)}>
+            <span className="month-btn-label">{m.label}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span className="month-btn-amount">{fmtPEN(m.total)}</span>
+              <span style={{ color: "var(--text3)", fontSize: 12 }}>{selectedMonth === m.mk ? "▲" : "▼"}</span>
+            </div>
+          </button>
+          {selectedMonth === m.mk && selData && (
+            <div className="card" style={{ marginTop: -4, borderTop: "none", borderRadius: "0 0 var(--radius) var(--radius)" }}>
+              {selData.items.sort((a,b) => new Date(b.fecha)-new Date(a.fecha)).map(g => (
+                <GastoRow key={g.id} gasto={g} onEdit={onEdit} onDelete={onDelete} />
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. PANTALLA RESUMEN (DASHBOARD)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ResumenScreen({ gastos, ingresos, onAddIngreso, onDeleteIngreso }) {
+  const mk = currentMonthKey();
+  const prevMk = (() => {
+    const d = new Date(); d.setMonth(d.getMonth() - 1);
+    return monthKey(d);
+  })();
+
+  const thisMonthGastos = useMemo(() => gastos.filter(g => monthKey(g.fecha) === mk), [gastos, mk]);
+  const prevMonthGastos = useMemo(() => gastos.filter(g => monthKey(g.fecha) === prevMk), [gastos, prevMk]);
+  const thisMonthIngresos = useMemo(() => ingresos.filter(i => monthKey(i.fecha) === mk), [ingresos, mk]);
+
+  const total     = thisMonthGastos.reduce((s,g) => s+g.monto, 0);
+  const prevTotal = prevMonthGastos.reduce((s,g) => s+g.monto, 0);
+  const avgDaily  = total / Math.max(daysElapsed(), 1);
+  const proyeccion= avgDaily * daysInMonth(mk);
+  const diff      = prevTotal > 0 ? ((total - prevTotal) / prevTotal) * 100 : null;
+  const totalIngresos = thisMonthIngresos.reduce((s,i) => s+i.monto, 0);
+
+  // Categoría con mayor gasto
+  const catTotals = useMemo(() => {
+    const m = {};
+    thisMonthGastos.forEach(g => { m[g.categoria] = (m[g.categoria]||0) + g.monto; });
+    return Object.entries(m).sort(([,a],[,b]) => b-a);
+  }, [thisMonthGastos]);
+  const topCat = catTotals[0];
+
+  // Datos torta
+  const pieData = catTotals.map(([name, value]) => ({ name, value: parseFloat(value.toFixed(2)) }));
+
+  // Datos barras últimos 5 meses
+  const barData = useMemo(() => {
+    return Array.from({ length: 5 }, (_, i) => {
+      const d = new Date();
+      d.setMonth(d.getMonth() - (4 - i));
+      const key = monthKey(d);
+      const sum = gastos.filter(g => monthKey(g.fecha) === key).reduce((s,g) => s+g.monto, 0);
+      return { name: MONTHS_SHORT[d.getMonth()], total: parseFloat(sum.toFixed(2)) };
+    });
+  }, [gastos]);
+
+  // Detección de aumento en categorías
+  const catAlerts = useMemo(() => {
+    const alerts = [];
+    const prevCatTotals = {};
+    prevMonthGastos.forEach(g => { prevCatTotals[g.categoria] = (prevCatTotals[g.categoria]||0) + g.monto; });
+    catTotals.forEach(([cat, total]) => {
+      const prev = prevCatTotals[cat] || 0;
+      if (prev > 0 && total > prev * 1.2) {
+        alerts.push({ cat, pct: ((total-prev)/prev)*100 });
+      }
+    });
+    return alerts;
+  }, [catTotals, prevMonthGastos]);
+
+  const [showIngresoForm, setShowIngresoForm] = useState(false);
+  const [ingresoForm, setIngresoForm] = useState({ tipo: "Sueldo", monto: "", nota: "" });
+
+  const handleAddIngreso = () => {
+    if (!ingresoForm.monto || isNaN(ingresoForm.monto)) return;
+    onAddIngreso({ tipo: ingresoForm.tipo, monto: parseFloat(ingresoForm.monto), fecha: new Date().toISOString(), nota: ingresoForm.nota });
+    setIngresoForm({ tipo: "Sueldo", monto: "", nota: "" });
+    setShowIngresoForm(false);
+  };
+
+  return (
+    <div className="screen-pad">
+      <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 16 }}>Resumen</div>
+
+      {/* KPIs */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+        {[
+          { label: "Total del mes", value: fmtPEN(total), color: "var(--red)" },
+          { label: "Promedio diario", value: fmtPEN(avgDaily), color: "var(--blue)" },
+          { label: "Proyección fin de mes", value: fmtPEN(proyeccion), color: "var(--yellow)" },
+          { label: "Top categoría", value: topCat ? topCat[0] : "—", color: "var(--green)" },
+        ].map(k => (
+          <div key={k.label} className="card card-sm" style={{ margin: 0 }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: k.color, marginBottom: 4 }}>{k.value}</div>
+            <div style={{ fontSize: 11, color: "var(--text3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{k.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Insights */}
+      {diff !== null && (
+        <div className="insight-card">
+          <div className="insight-icon">{diff > 0 ? "📈" : "📉"}</div>
+          <div>
+            <div className="insight-title">vs mes anterior</div>
+            <div className="insight-desc">
+              {diff > 0
+                ? `Gastaste ${diff.toFixed(0)}% más que en ${monthLabel(prevMk)}.`
+                : `Gastaste ${Math.abs(diff).toFixed(0)}% menos que en ${monthLabel(prevMk)}.`}
+            </div>
+          </div>
+          <span className={`badge ${diff > 0 ? "badge-red" : "badge-green"}`} style={{ marginLeft: "auto", alignSelf: "flex-start" }}>
+            {diff > 0 ? "+" : ""}{diff.toFixed(0)}%
+          </span>
+        </div>
+      )}
+
+      {catAlerts.map(a => (
+        <div key={a.cat} className="insight-card">
+          <div className="insight-icon">⚠️</div>
+          <div>
+            <div className="insight-title">Aumento en {a.cat}</div>
+            <div className="insight-desc">Gasto {a.pct.toFixed(0)}% mayor que el mes pasado.</div>
+          </div>
+        </div>
+      ))}
+
+      {proyeccion > prevTotal && prevTotal > 0 && (
+        <div className="insight-card">
+          <div className="insight-icon">🔮</div>
+          <div>
+            <div className="insight-title">Proyección elevada</div>
+            <div className="insight-desc">Vas a gastar ~{fmtPEN(proyeccion)} este mes, más que el mes pasado ({fmtPEN(prevTotal)}).</div>
+          </div>
+        </div>
+      )}
+
+      {/* Torta */}
+      {pieData.length > 0 && (
+        <div className="card">
+          <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.08em" }}>Distribución por categoría</div>
+          <div className="chart-wrap" style={{ height: 220 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80}
+                  label={({ name, percent }) => `${name} ${(percent*100).toFixed(0)}%`}
+                  labelLine={{ stroke: "var(--text3)" }}>
+                  {pieData.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                </Pie>
+                <Tooltip content={<ChartTooltip />} />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
+      {/* Barras */}
+      <div className="card">
+        <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.08em" }}>Últimos 5 meses</div>
+        <div className="chart-wrap" style={{ height: 160 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={barData} barCategoryGap="30%">
+              <XAxis dataKey="name" tick={{ fill: "var(--text3)", fontSize: 10 }} axisLine={false} tickLine={false} />
+              <YAxis hide />
+              <Tooltip content={<ChartTooltip />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
+              <Bar dataKey="total" fill="var(--blue)" radius={[4,4,0,0]} name="Total" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* Ingresos */}
+      <div className="card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div style={{ fontSize: 13, fontWeight: 500 }}>Ingresos del mes</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ color: "var(--green)", fontWeight: 700 }}>{fmtPEN(totalIngresos)}</span>
+            <button className="section-action btn-sm" onClick={() => setShowIngresoForm(p => !p)}>+ Agregar</button>
+          </div>
+        </div>
+        {showIngresoForm && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 14, padding: 14, background: "var(--bg3)", borderRadius: "var(--radius-sm)" }}>
+            <div className="field-row">
+              <select value={ingresoForm.tipo} onChange={e => setIngresoForm(p => ({...p, tipo: e.target.value}))}>
+                {INCOME_TYPES.map(t => <option key={t}>{t}</option>)}
+              </select>
+              <input type="number" placeholder="Monto" value={ingresoForm.monto}
+                onChange={e => setIngresoForm(p => ({...p, monto: e.target.value}))} />
+            </div>
+            <input placeholder="Nota (opcional)" value={ingresoForm.nota}
+              onChange={e => setIngresoForm(p => ({...p, nota: e.target.value}))} />
+            <button className="btn btn-primary btn-sm" onClick={handleAddIngreso}>Agregar ingreso</button>
+          </div>
+        )}
+        {thisMonthIngresos.length === 0 ? (
+          <div style={{ color: "var(--text3)", fontSize: 13, textAlign: "center", padding: "12px 0" }}>Sin ingresos registrados</div>
+        ) : thisMonthIngresos.map(i => (
+          <div key={i.id} className="ingreso-item">
+            <span style={{ fontSize: 20 }}>💰</span>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 500 }}>{i.tipo}</div>
+              {i.nota && <div style={{ fontSize: 11, color: "var(--text3)" }}>{i.nota}</div>}
+              <div style={{ fontSize: 11, color: "var(--text3)" }}>{fmtDate(i.fecha)}</div>
+            </div>
+            <div className="ingreso-monto">{fmtPEN(i.monto)}</div>
+            <button className="icon-btn" onClick={() => onDeleteIngreso(i.id)}>🗑️</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. PANTALLA FIJOS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function FijosScreen({ fijos, onAdd, onEdit, onDelete, onTogglePagado }) {
+  const mk = currentMonthKey();
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing]   = useState(null);
+  const [form, setForm]         = useState({ nombre: "", monto: "", dia: 1 });
+  const [err, setErr]           = useState({});
+
+  const totalFijos = fijos.reduce((s, f) => s + f.monto, 0);
+  const pagados    = fijos.filter(f => (f.pagadoEn || []).includes(mk));
+  const totalPagado= pagados.reduce((s, f) => s + f.monto, 0);
+
+  const validate = () => {
+    const e = {};
+    if (!form.nombre.trim()) e.nombre = "Requerido";
+    if (!form.monto || isNaN(form.monto) || Number(form.monto) <= 0) e.monto = "Inválido";
+    if (!form.dia || form.dia < 1 || form.dia > 31) e.dia = "1-31";
+    setErr(e);
+    return !Object.keys(e).length;
+  };
+
+  const handleSave = () => {
+    if (!validate()) return;
+    const data = { nombre: form.nombre.trim(), monto: parseFloat(form.monto), dia: parseInt(form.dia) };
+    if (editing) { onEdit(editing, data); setEditing(null); }
+    else         { onAdd(data); }
+    setForm({ nombre: "", monto: "", dia: 1 });
+    setShowForm(false);
+  };
+
+  const startEdit = (f) => {
+    setEditing(f.id);
+    setForm({ nombre: f.nombre, monto: f.monto, dia: f.dia });
+    setShowForm(true);
+  };
+
+  return (
+    <div className="screen-pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+        <div style={{ fontSize: 20, fontWeight: 700 }}>Gastos Fijos</div>
+        <button className="btn btn-primary btn-sm" onClick={() => { setEditing(null); setForm({ nombre:"",monto:"",dia:1 }); setShowForm(p=>!p); }}>
+          {showForm ? "Cerrar" : "+ Nuevo"}
+        </button>
+      </div>
+
+      {/* Resumen */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+        <div className="kpi-card" style={{ flex: 1, textAlign: "center", padding: "12px" }}>
+          <div className="kpi-value" style={{ color: "var(--red)" }}>{fmtPEN(totalFijos)}</div>
+          <div className="kpi-label">Total fijos</div>
+        </div>
+        <div className="kpi-card" style={{ flex: 1, textAlign: "center", padding: "12px" }}>
+          <div className="kpi-value" style={{ color: "var(--green)" }}>{fmtPEN(totalPagado)}</div>
+          <div className="kpi-label">Pagado ({pagados.length}/{fijos.length})</div>
+        </div>
+      </div>
+
+      {/* Formulario */}
+      {showForm && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>{editing ? "Editar fijo" : "Nuevo gasto fijo"}</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div>
+              <div className="field-label">Nombre</div>
+              <input placeholder="Ej: Alquiler" value={form.nombre} onChange={e => setForm(p=>({...p, nombre: e.target.value}))} />
+              {err.nombre && <div style={{ color:"var(--red)", fontSize:11, marginTop:4 }}>{err.nombre}</div>}
+            </div>
+            <div className="field-row">
+              <div>
+                <div className="field-label">Monto (PEN)</div>
+                <input type="number" placeholder="0.00" value={form.monto} onChange={e => setForm(p=>({...p, monto: e.target.value}))} />
+                {err.monto && <div style={{ color:"var(--red)", fontSize:11, marginTop:4 }}>{err.monto}</div>}
+              </div>
+              <div>
+                <div className="field-label">Día del mes</div>
+                <input type="number" min="1" max="31" value={form.dia} onChange={e => setForm(p=>({...p, dia: e.target.value}))} />
+                {err.dia && <div style={{ color:"var(--red)", fontSize:11, marginTop:4 }}>{err.dia}</div>}
+              </div>
+            </div>
+            <div className="field-row">
+              <button className="btn btn-primary" onClick={handleSave}>{editing ? "Guardar" : "Agregar"}</button>
+              <button className="btn btn-ghost" onClick={() => { setShowForm(false); setEditing(null); }}>Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Lista */}
+      {fijos.length === 0 ? (
+        <div className="empty"><div className="empty-icon">📌</div><div className="empty-text">No hay gastos fijos</div></div>
+      ) : (
+        <div className="card">
+          {fijos.map(f => {
+            const isPagado = (f.pagadoEn || []).includes(mk);
+            return (
+              <div key={f.id} className="fijo-item">
+                <div className={`fijo-check ${isPagado ? "done" : ""}`} onClick={() => onTogglePagado(f.id)}>
+                  {isPagado && <span style={{ color:"#fff", fontSize:12 }}>✓</span>}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 500, textDecoration: isPagado ? "line-through" : "none", color: isPagado ? "var(--text3)" : "var(--text)" }}>
+                    {f.nombre}
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--text3)" }}>Día {f.dia} de cada mes</div>
+                </div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: isPagado ? "var(--green)" : "var(--red)", marginRight: 8 }}>
+                  {fmtPEN(f.monto)}
+                </div>
+                <div className="gasto-actions">
+                  <button className="icon-btn" onClick={() => startEdit(f)}>✏️</button>
+                  <button className="icon-btn" onClick={() => onDelete(f.id)}>🗑️</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. PANTALLA CONFIGURACIÓN (Google Sheets)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ConfigScreen({ config, onSave }) {
+  const [form, setForm] = useState({ apiKey: config.apiKey || "", spreadsheetId: config.spreadsheetId || "" });
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState(null);
+
+  const handleTest = async () => {
+    if (!form.apiKey || !form.spreadsheetId) return;
+    setTesting(true); setTestResult(null);
+    try {
+      await sheetsRead({ apiKey: form.apiKey, spreadsheetId: form.spreadsheetId }, SHEET_GASTOS);
+      setTestResult("ok");
+    } catch { setTestResult("error"); }
+    setTesting(false);
+  };
+
+  return (
+    <div className="config-section">
+      <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>Configuración</div>
+      <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 20 }}>Conexión con Google Sheets API</div>
+
+      {/* Instrucciones */}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12, color: "var(--text2)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          Configuración paso a paso
+        </div>
+        {[
+          ["Ir a console.cloud.google.com y crear un proyecto nuevo"],
+          ["Activar la API: APIs y servicios → Biblioteca → buscar «Google Sheets API»"],
+          ["Crear credencial: APIs y servicios → Credenciales → + Crear credenciales → Clave de API"],
+          ["Copiar la API Key y pegarla abajo"],
+          ["Crear un Google Sheet vacío en tu Drive"],
+          ['Crear 4 hojas con exactamente estos nombres: "Gastos", "Fijos", "Categorias", "Ingresos"'],
+          ["Compartir el Sheet: clic en Compartir → «Cualquier persona con el enlace» → Editor"],
+          ["Copiar el ID del Sheet desde la URL: docs.google.com/spreadsheets/d/[ESTE-ES-EL-ID]/edit"],
+        ].map(([s], i) => (
+          <div key={i} className="step-row">
+            <div className="step-num">{i+1}</div>
+            <div className="step-text">{s}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Formulario */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        <div>
+          <div className="field-label">API Key de Google</div>
+          <input type="password" placeholder="AIza..." value={form.apiKey} onChange={e => setForm(p=>({...p, apiKey: e.target.value}))} />
+        </div>
+        <div>
+          <div className="field-label">Spreadsheet ID</div>
+          <input placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms" value={form.spreadsheetId}
+            onChange={e => setForm(p=>({...p, spreadsheetId: e.target.value}))} />
+        </div>
+
+        <button className="btn btn-ghost" onClick={handleTest} disabled={testing || !form.apiKey || !form.spreadsheetId}>
+          {testing ? <span><span className="spin">↻</span> Probando…</span> : "Probar conexión"}
+        </button>
+
+        {testResult === "ok"    && <div style={{ color: "var(--green)", fontSize: 13, textAlign: "center" }}>✅ Conexión exitosa</div>}
+        {testResult === "error" && <div style={{ color: "var(--red)", fontSize: 13, textAlign: "center" }}>❌ Error — revisa las credenciales y que el Sheet sea público</div>}
+
+        <button className="btn btn-primary" onClick={() => onSave(form)}
+          disabled={!form.apiKey || !form.spreadsheetId}>
+          Guardar configuración
+        </button>
+      </div>
+
+      {/* Info version */}
+      <div style={{ textAlign: "center", marginTop: 32, color: "var(--text3)", fontSize: 11 }}>
+        Gestor de Gastos v{VERSION} · Datos locales en localStorage
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. APP PRINCIPAL
+// ─────────────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const {
+    state,
+    addGasto, editGasto, deleteGasto,
+    addFijo, editFijo, deleteFijo, toggleFijoPagado,
+    addCategoria,
+    addIngreso, deleteIngreso,
+    setConfig, mergeFromSheets, updateLastSync,
+  } = useAppState();
+
+  const { toasts, show: showToast } = useToast();
+  const { confirmState, ask: askConfirm, answer: answerConfirm } = useConfirm();
+
+  const [tab, setTab]             = useState("mes");
+  const [gastoModal, setGastoModal] = useState(false);
+  const [editingGasto, setEditingGasto] = useState(null);
+  const [showConfig, setShowConfig]     = useState(false);
+  const [syncStatus, setSyncStatus]     = useState("idle");
+
+  // ─── Auto-sync cuando hay conexión (simulado: al montar si hay config) ───
+  useEffect(() => {
+    if (state.config.apiKey && state.config.spreadsheetId) {
+      handleSync();
+    }
+  // eslint-disable-next-line
+  }, []);
+
+  // ─── Online/offline listener ───
+  useEffect(() => {
+    const handleOnline = () => {
+      if (state.config.apiKey && state.config.spreadsheetId) {
+        showToast("Conexión restaurada. Sincronizando…");
+        handleSync();
+      }
+    };
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
+  // eslint-disable-next-line
+  }, [state.config]);
+
+  // ─── SYNC ───
+  const handleSync = async () => {
+    const { apiKey, spreadsheetId } = state.config;
+    if (!apiKey || !spreadsheetId) {
+      showToast("Configura Google Sheets primero", "error");
+      setShowConfig(true);
+      return;
+    }
+    setSyncStatus("loading");
+    try {
+      // Sube primero (last-write-wins) luego descarga para tener datos frescos
+      await syncToSheets(state.config, state);
+      const remote = await syncFromSheets(state.config);
+      mergeFromSheets(remote);
+      setSyncStatus("ok");
+      showToast("Sincronizado con Google Sheets ✓");
+    } catch (e) {
+      setSyncStatus("error");
+      showToast("Error al sincronizar: " + e.message, "error");
+    }
+  };
+
+  // ─── CRUD handlers con confirmación ───
+  const handleDeleteGasto = async (gasto) => {
+    const ok = await askConfirm("¿Eliminar gasto?", `Se eliminará "${gasto.nombre}" (${fmtPEN(gasto.monto)}). Esta acción no se puede deshacer.`);
+    if (ok) { deleteGasto(gasto.id); showToast("Gasto eliminado"); }
+  };
+
+  const handleDeleteFijo = async (id) => {
+    const fijo = state.fijos.find(f => f.id === id);
+    const ok = await askConfirm("¿Eliminar gasto fijo?", `Se eliminará "${fijo?.nombre}". Esta acción no se puede deshacer.`);
+    if (ok) { deleteFijo(id); showToast("Gasto fijo eliminado"); }
+  };
+
+  const handleEditGasto = (gasto) => {
+    setEditingGasto(gasto);
+    setGastoModal(true);
+  };
+
+  const handleSaveGasto = (data) => {
+    // Agrega nuevas categorías automáticamente
+    if (data.categoria && !state.categorias.includes(data.categoria) && data.categoria !== "Fijos") {
+      addCategoria(data.categoria);
+    }
+    if (editingGasto) {
+      editGasto(editingGasto.id, data);
+      showToast("Gasto actualizado ✓");
+    } else {
+      addGasto(data);
+      showToast("Gasto agregado ✓");
+    }
+    setEditingGasto(null);
+    setGastoModal(false);
+  };
+
+  // ─── Exportar CSV ───
+  const handleExport = () => {
+    const mk = currentMonthKey();
+    const monthGastos = state.gastos.filter(g => monthKey(g.fecha) === mk);
+    exportCSV(monthGastos);
+    showToast("CSV descargado ✓");
+  };
+
+  // ─── RENDER ───
+  const navItems = [
+    { id: "mes",      icon: "📅", label: "Mi mes" },
+    { id: "historico",icon: "📊", label: "Histórico" },
+    { id: "resumen",  icon: "🧮", label: "Resumen" },
+    { id: "fijos",    icon: "📌", label: "Fijos" },
+  ];
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <div className="app-shell">
+
+        {/* Config button (esquina superior derecha) */}
+        <button onClick={() => setShowConfig(p => !p)}
+          style={{ position: "fixed", top: 14, right: 14, zIndex: 40, background: "var(--bg3)", border: "1px solid var(--border)", borderRadius: "50%", width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>
+          ⚙️
+        </button>
+
+        {/* Pantalla */}
+        <div className="screen">
+          {showConfig ? (
+            <div className="screen-pad" style={{ paddingTop: 56 }}>
+              <ConfigScreen config={state.config} onSave={(cfg) => { setConfig(cfg); showToast("Configuración guardada"); setShowConfig(false); }} />
+            </div>
+          ) : tab === "mes" ? (
+            <MiMesScreen
+              gastos={state.gastos}
+              categorias={state.categorias}
+              onEdit={handleEditGasto}
+              onDelete={handleDeleteGasto}
+              syncStatus={syncStatus}
+              lastSync={state.config.lastSync}
+              onSync={handleSync}
+              onExport={handleExport}
+            />
+          ) : tab === "historico" ? (
+            <HistoricoScreen gastos={state.gastos} categorias={state.categorias} onEdit={handleEditGasto} onDelete={handleDeleteGasto} />
+          ) : tab === "resumen" ? (
+            <ResumenScreen gastos={state.gastos} ingresos={state.ingresos} onAddIngreso={addIngreso} onDeleteIngreso={deleteIngreso} />
+          ) : tab === "fijos" ? (
+            <FijosScreen fijos={state.fijos} onAdd={addFijo} onEdit={editFijo} onDelete={handleDeleteFijo} onTogglePagado={toggleFijoPagado} />
+          ) : null}
+        </div>
+
+        {/* FAB */}
+        {!showConfig && (
+          <button className="fab" onClick={() => { setEditingGasto(null); setGastoModal(true); }}>+</button>
+        )}
+
+        {/* Bottom Nav */}
+        <nav className="bottom-nav">
+          {navItems.map((item, i) => {
+            const isMid = i === 1 || i === 2;
+            return (
+              <button
+                key={item.id}
+                className={`nav-item ${tab === item.id && !showConfig ? "active" : ""} ${isMid ? "fab-placeholder" : ""}`}
+                onClick={() => { setTab(item.id); setShowConfig(false); }}
+                style={i === 1 ? { paddingLeft: 0 } : i === 2 ? { paddingRight: 0 } : {}}
+              >
+                <span className="nav-icon">{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* Modal de gasto */}
+        {gastoModal && (
+          <GastoModal
+            onClose={() => { setGastoModal(false); setEditingGasto(null); }}
+            onSave={handleSaveGasto}
+            initial={editingGasto}
+            categorias={state.categorias}
+            gastos={state.gastos}
+          />
+        )}
+
+        {/* Confirmación */}
+        <ConfirmDialog state={confirmState} onAnswer={answerConfirm} />
+
+        {/* Toasts */}
+        <ToastContainer toasts={toasts} />
+      </div>
+    </>
+  );
+}
